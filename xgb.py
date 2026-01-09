@@ -9,6 +9,35 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.model_selection import RandomizedSearchCV
 from scipy.sparse import hstack
 
+# --- GLOBAL HELPER FUNCTIONS (MUST BE OUTSIDE MAIN) ---
+def clean_dataframe(df):
+    df = df.copy()
+    # Fill missing text
+    text_cols = ['Headline', 'Reasoning', 'Key Insights', 'Lead Types', 'Power Mentions', 'Agencies', 'Tags']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+    
+    # Parse list-like strings
+    list_cols = ['Lead Types', 'Power Mentions', 'Agencies', 'Tags']
+    for col in list_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: [item.strip() for item in str(x).split(';') if item.strip()])
+    
+    # Generate Count Features
+    df['count_leads'] = df['Lead Types'].apply(len)
+    df['count_mentions'] = df['Power Mentions'].apply(len)
+    df['count_agencies'] = df['Agencies'].apply(len)
+    df['text_len'] = df['Reasoning'].apply(len)
+    
+    # Combine text
+    df['full_text'] = (
+        df['Headline'] + " " + 
+        df['Reasoning'] + " " + 
+        df['Key Insights']
+    )
+    return df
+
 def main():
     # --- CONFIGURATION ---
     CURRENT_DIR = os.getcwd()
@@ -22,30 +51,14 @@ def main():
 
     # Leave 2 CPU cores free so the computer doesn't freeze
     N_JOBS = max(1, os.cpu_count() - 2)
-
-    def clean_dataframe(df):
-        df = df.copy()
-        text_cols = ['Headline', 'Reasoning', 'Key Insights', 'Lead Types', 'Power Mentions', 'Agencies', 'Tags']
-        for col in text_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna("")
-        
-        list_cols = ['Lead Types', 'Power Mentions', 'Agencies', 'Tags']
-        for col in list_cols:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: [item.strip() for item in str(x).split(';') if item.strip()])
-        
-        df['count_leads'] = df['Lead Types'].apply(len)
-        df['count_mentions'] = df['Power Mentions'].apply(len)
-        df['count_agencies'] = df['Agencies'].apply(len)
-        df['text_len'] = df['Reasoning'].apply(len)
-        
-        df['full_text'] = (df['Headline'] + " " + df['Reasoning'] + " " + df['Key Insights'])
-        return df
-
+    
     print(f"Loading datasets from {CURRENT_DIR}...")
-    train = pd.read_csv(TRAIN_PATH)
-    test = pd.read_csv(TEST_PATH)
+    try:
+        train = pd.read_csv(TRAIN_PATH)
+        test = pd.read_csv(TEST_PATH)
+    except FileNotFoundError:
+        print(f"❌ ERROR: Files not found in {CURRENT_DIR}")
+        return
 
     print("Cleaning data...")
     train_clean = clean_dataframe(train)
@@ -71,11 +84,12 @@ def main():
     # --- MODEL TRAINING ---
     print("Initializing XGBoost with GPU support...")
 
+    # Set n_jobs to 1 inside the model to let the Search handle parallelism
     xgb_model = xgb.XGBRegressor(
         objective='reg:squarederror',
         tree_method='hist',
         device='cuda',
-        n_jobs=N_JOBS,
+        n_jobs=1,  # Keep this 1, let RandomizedSearchCV handle the threads
         random_state=42
     )
 
@@ -87,18 +101,19 @@ def main():
         'colsample_bytree': [0.7, 0.8]
     }
 
+    print(f"Starting Randomized Search on GPU using {N_JOBS} workers...")
+    
     search = RandomizedSearchCV(
         estimator=xgb_model,
         param_distributions=param_dist,
         n_iter=10, 
         scoring='neg_root_mean_squared_error',
         cv=3,
-        verbose=6,
-        n_jobs=N_JOBS,
+        verbose=10, # High verbosity to see progress
+        n_jobs=N_JOBS, # Parallelism happens here
         random_state=42
     )
 
-    print("Starting Randomized Search on GPU...")
     start_time = time.time()
     search.fit(X_train, y_train)
     elapsed = (time.time() - start_time) / 60
@@ -117,6 +132,6 @@ def main():
     submission_df.to_csv(SUBMISSION_FILE, index=False)
     print(f"Submission saved to {SUBMISSION_FILE}")
 
-# This line is CRITICAL for Windows users to prevent infinite loops
+# --- SAFETY BLOCK ---
 if __name__ == "__main__":
     main()
